@@ -1,6 +1,6 @@
 # SSSD_replication
 
-This repository is a replication of SSSD imputers in Tensorflow.
+This repository is a replication of SSSD imputers.
 
 Reference: https://arxiv.org/abs/2208.09399
 
