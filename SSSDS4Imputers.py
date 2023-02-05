@@ -1,6 +1,7 @@
 import math
 import tensorflow as tf
 from tensorflow import keras
+from imputers.S4Model import S4Layer
 
 class Residual_block(keras.layers.Layer):
     def __init__(self, res_channels, skip_channels,
