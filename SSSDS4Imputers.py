@@ -37,12 +37,12 @@ class Residual_block(keras.layers.Layer):
         self.cond_conv = keras.layers.Conv2D(2 * in_channels, 2 * self.res_channels, kernel_size=1)
 
         self.res_conv = keras.layers.Conv1D(res_channels, res_channels, kernel_size=1)
-        self.res_conv = nn.utils.weight_norm(self.res_conv)
-        nn.init.kaiming_normal_(self.res_conv.weight)
+        self.res_conv = tfa.layers.WeightNormalization(self.res_conv)
+        keras.initializers.HeNormal(self.res_conv.weight)
 
         self.skip_conv = keras.layers.Conv1D(res_channels, skip_channels, kernel_size=1)
-        self.skip_conv = nn.utils.weight_norm(self.skip_conv)
-        nn.init.kaiming_normal_(self.skip_conv.weight)
+        self.skip_conv = tfa.layers.WeightNormalization(self.skip_conv)
+        keras.initializers.HeNormal(self.skip_conv.weight)
 
     def forward(self, input_data):
         x, cond, diffusion_step_embed = input_data
@@ -145,7 +145,6 @@ class SSSDS4Imputer(keras.layers.Layer):
         self.final_conv = keras.Sequential([
             keras.layers.Conv2D(skip_channels, skip_channels, kernel_size=1, activation='relu'),
             keras.layers.Conv1D(skip_channels, out_channels, kernel_size=1, padding='same') # padding: 'same', padding zeroes evenly to the left/right
-            # ZeroConv1d(skip_channels, out_channels)
         ])
 
     def call(self, input_data):
