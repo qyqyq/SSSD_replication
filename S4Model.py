@@ -65,8 +65,8 @@ class S4(keras.layers.Layer):
 
         # Pointwise
         self.activation = Activation(activation)
-        dropout_fn = nn.Dropout2d if self.transposed else nn.Dropout
-        self.dropout = dropout_fn(dropout) if dropout > 0.0 else nn.Identity()
+        dropout_fn = keras.layers.SpatialDropout2D if self.transposed else keras.layers.Dropout
+        self.dropout = dropout_fn(dropout) if dropout > 0.0 else keras.layers.Identity()
 
         # position-wise output transform to mix features
         self.output_linear = LinearActivation(
@@ -171,8 +171,8 @@ class S4Layer(keras.layers.Layer):
                             l_max=lmax,
                             bidirectional=bidirectional)
 
-        self.norm_layer = nn.LayerNorm(features) if layer_norm else nn.Identity()
-        self.dropout = nn.Dropout2d(dropout) if dropout >0 else nn.Identity()
+        self.norm_layer = keras.layers.LayerNormalization(features) if layer_norm else keras.layers.Identity()
+        self.dropout = keras.layers.SpatialDropout2D(dropout) if dropout >0 else keras.layers.Identity()
 
     def forward(self, x):
         # x has shape seq, batch, feature
