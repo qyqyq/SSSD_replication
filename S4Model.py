@@ -1,5 +1,7 @@
+import tensorflow as tf
 from tensorflow import keras
-
+from einops import rearrange
+from opt_einsum import contract
 
 class S4(keras.layers.Layer):
 
@@ -100,10 +102,14 @@ class S4(keras.layers.Layer):
             k = F.pad(k0, (0, L)) \
                 + F.pad(k1.flip(-1), (L, 0)) \
 
-        k_f = torch.fft.rfft(k, n=2 * L)  # (C H L)
-        u_f = torch.fft.rfft(u, n=2 * L)  # (B H L)
+        # k_f = torch.fft.rfft(k, n=2 * L)  # (C H L)
+        k_f = tf.signal.rfft(input=k, fft_length=2 * L)  # (C H L)
+        # u_f = torch.fft.rfft(u, n=2 * L)  # (B H L)
+        u_f = tf.signal.rfft(input=u, fft_length=2 * L)  # (B H L)
+
         y_f = contract('bhl,chl->bchl', u_f, k_f)  # k_f.unsqueeze(-4) * u_f.unsqueeze(-3) # (B C H L)
-        y = torch.fft.irfft(y_f, n=2 * L)[..., :L]  # (B C H L)
+        # y = torch.fft.irfft(y_f, n=2 * L)[..., :L]  # (B C H L)
+        y = tf.signal.irfft(y_f, n=2 * L)[..., :L]  # (B C H L)
 
         # Compute D term in state space equation - essentially a skip connection
         y = y + contract('bhl,ch->bchl', u, self.D)  # u.unsqueeze(-3) * self.D.unsqueeze(-1)
