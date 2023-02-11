@@ -2,8 +2,8 @@ import math
 import tensorflow as tf
 import tensorflow_addons as tfa
 from tensorflow import keras
-from .S4Model import S4Layer
-from .util import calc_diffusion_step_embedding
+from S4Model import S4Layer
+from util import calc_diffusion_step_embedding
 
 class Residual_block(keras.layers.Layer):
     def __init__(self, res_channels, skip_channels,

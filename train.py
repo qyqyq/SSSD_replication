@@ -1,8 +1,8 @@
 import argparse
 import json
-from .util import calc_diffusion_hyperparams
+from util import calc_diffusion_hyperparams
 import os
-from .SSSDS4Imputers import SSSDS4Imputer
+from SSSDS4Imputers import SSSDS4Imputer
 
 
 def train(output_directory,
