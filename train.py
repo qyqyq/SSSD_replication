@@ -27,13 +27,13 @@ def train(output_directory,
         os.chmod(output_directory, 0o775)
     print("output directory", output_directory, flush=True)
 
-    # map diffusion hyperparameters to gpu
-    for key in diffusion_hyperparams:
-        if key != "T":
-            diffusion_hyperparams[key] = diffusion_hyperparams[key].cuda()
+    # # map diffusion hyperparameters to gpu
+    # for key in diffusion_hyperparams:
+    #     if key != "T":
+    #         diffusion_hyperparams[key] = diffusion_hyperparams[key]
 
     # predefine model
-    net = SSSDS4Imputer(**model_config).cuda()
+    net = SSSDS4Imputer(**model_config)
     print_size(net)
 
     # define optimizer

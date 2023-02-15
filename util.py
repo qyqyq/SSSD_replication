@@ -1,6 +1,7 @@
 import os
 import numpy as np
 import random
+import tensorflow as tf
 
 
 
@@ -88,10 +89,10 @@ def calc_diffusion_step_embedding(diffusion_steps, diffusion_step_embed_dim_in):
 
     half_dim = diffusion_step_embed_dim_in // 2
     _embed = np.log(10000) / (half_dim - 1)
-    _embed = torch.exp(torch.arange(half_dim) * -_embed).cuda()
+    _embed = tf.math.exp(tf.range(half_dim) * -_embed)
     _embed = diffusion_steps * _embed
-    diffusion_step_embed = torch.cat((torch.sin(_embed),
-                                      torch.cos(_embed)), 1)
+    diffusion_step_embed = tf.concat((tf.math.sin(_embed),
+                                      tf.math.cos(_embed)), 1)
 
     return diffusion_step_embed
 
@@ -111,7 +112,7 @@ def calc_diffusion_hyperparams(T, beta_0, beta_T):
         These cpu tensors are changed to cuda tensors on each individual gpu
     """
 
-    Beta = torch.linspace(beta_0, beta_T, T)  # Linear schedule
+    Beta = np.linspace(beta_0, beta_T, T)  # Linear schedule
     Alpha = 1 - Beta
     Alpha_bar = Alpha + 0
     Beta_tilde = Beta + 0
@@ -120,7 +121,7 @@ def calc_diffusion_hyperparams(T, beta_0, beta_T):
         Beta_tilde[t] *= (1 - Alpha_bar[t - 1]) / (
                 1 - Alpha_bar[t])  # \tilde{\beta}_t = \beta_t * (1-\bar{\alpha}_{t-1})
         # / (1-\bar{\alpha}_t)
-    Sigma = torch.sqrt(Beta_tilde)  # \sigma_t^2  = \tilde{\beta}_t
+    Sigma = tf.math.sqrt(Beta_tilde)  # \sigma_t^2  = \tilde{\beta}_t
 
     _dh = {}
     _dh["T"], _dh["Beta"], _dh["Alpha"], _dh["Alpha_bar"], _dh["Sigma"] = T, Beta, Alpha, Alpha_bar, Sigma
