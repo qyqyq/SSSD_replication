@@ -16,7 +16,7 @@ class Residual_block(keras.layers.Layer):
         super(Residual_block, self).__init__()
         self.res_channels = res_channels
 
-        self.fc_t = keras.layers.Dense(diffusion_step_embed_dim_out, self.res_channels)
+        self.fc_t = keras.layers.Dense(self.res_channels)
 
         self.S41 = S4Layer(features=2 * self.res_channels,
                            lmax=s4_lmax,
@@ -44,7 +44,7 @@ class Residual_block(keras.layers.Layer):
         self.skip_conv = tfa.layers.WeightNormalization(self.skip_conv)
         keras.initializers.HeNormal(self.skip_conv.weight)
 
-    def forward(self, input_data):
+    def call(self, input_data):
         x, cond, diffusion_step_embed = input_data
         h = x
         B, C, L = x.shape
@@ -86,8 +86,8 @@ class Residual_group(keras.layers.Layer):
         self.num_res_layers = num_res_layers
         self.diffusion_step_embed_dim_in = diffusion_step_embed_dim_in
 
-        self.fc_t1 = keras.layers.Dense(diffusion_step_embed_dim_in, diffusion_step_embed_dim_mid)
-        self.fc_t2 = keras.layers.Dense(diffusion_step_embed_dim_mid, diffusion_step_embed_dim_out)
+        self.fc_t1 = keras.layers.Dense(diffusion_step_embed_dim_mid)
+        self.fc_t2 = keras.layers.Dense(diffusion_step_embed_dim_out)
 
         self.residual_blocks = []
         for n in range(self.num_res_layers):
@@ -100,7 +100,7 @@ class Residual_group(keras.layers.Layer):
                                                        s4_bidirectional=s4_bidirectional,
                                                        s4_layernorm=s4_layernorm))
 
-    def forward(self, input_data):
+    def call(self, input_data):
         noise, conditional, diffusion_steps = input_data
 
         diffusion_step_embed = calc_diffusion_step_embedding(diffusion_steps, self.diffusion_step_embed_dim_in)
@@ -115,7 +115,7 @@ class Residual_group(keras.layers.Layer):
 
         return skip * math.sqrt(1.0 / self.num_res_layers)
 
-class SSSDS4Imputer(keras.layers.Layer):
+class SSSDS4Imputer(keras.Model):
     def __init__(self, in_channels, res_channels, skip_channels, out_channels,
                  num_res_layers,
                  diffusion_step_embed_dim_in,
@@ -127,7 +127,7 @@ class SSSDS4Imputer(keras.layers.Layer):
                  s4_bidirectional,
                  s4_layernorm):
         super(SSSDS4Imputer, self).__init__()
-        self.init_conv = keras.layers.Conv2D(in_channels, res_channels, kernel_size=1, activation='relu')
+        self.init_conv = keras.layers.Conv2D(res_channels, kernel_size=1, activation='relu')
 
         self.residual_layer = Residual_group(res_channels=res_channels,
                                              skip_channels=skip_channels,

@@ -2,6 +2,118 @@ import tensorflow as tf
 from tensorflow import keras
 from einops import rearrange
 from opt_einsum import contract
+import math
+
+
+def nplr(measure, N, rank=1, dtype=torch.float):
+    """ Return w, p, q, V, B such that
+    (w - p q^*, B) is unitarily equivalent to the original HiPPO A, B by the matrix V
+    i.e. A = V[w - p q^*]V^*, B = V B
+    """
+    assert dtype == torch.float or torch.cfloat
+    if measure == 'random':
+        dtype = torch.cfloat if dtype == torch.float else torch.cdouble
+        # w = torch.randn(N//2, dtype=dtype)
+        w = -torch.exp(torch.randn(N//2)) + 1j*torch.randn(N//2)
+        P = torch.randn(rank, N//2, dtype=dtype)
+        B = torch.randn(N//2, dtype=dtype)
+        V = torch.eye(N, dtype=dtype)[..., :N//2] # Only used in testing
+        return w, P, B, V
+
+    A, B = transition(measure, N)
+    A = torch.as_tensor(A, dtype=dtype) # (N, N)
+    B = torch.as_tensor(B, dtype=dtype)[:, 0] # (N,)
+
+    P = rank_correction(measure, N, rank=rank, dtype=dtype)
+    AP = A + torch.sum(P.unsqueeze(-2)*P.unsqueeze(-1), dim=-3)
+    w, V = torch.linalg.eig(AP) # (..., N) (..., N, N)
+    # V w V^{-1} = A
+
+    # Only keep one of the conjugate pairs
+    w = w[..., 0::2].contiguous()
+    V = V[..., 0::2].contiguous()
+
+    V_inv = V.conj().transpose(-1, -2)
+
+    B = contract('ij, j -> i', V_inv, B.to(V)) # V^* B
+    P = contract('ij, ...j -> ...i', V_inv, P.to(V)) # V^* P
+
+
+    return w, P, B, V
+
+
+
+
+
+class HippoSSKernel(keras.layers.Layer):
+    """Wrapper around SSKernel that generates A, B, C, dt according to HiPPO arguments.
+    The SSKernel is expected to support the interface
+    forward()
+    default_state()
+    setup_step()
+    step()
+    """
+
+    def __init__(
+            self,
+            H,
+            N=64,
+            L=1,
+            measure="legs",
+            rank=1,
+            channels=1,  # 1-dim to C-dim map; can think of C as having separate "heads"
+            dt_min=0.001,
+            dt_max=0.1,
+            trainable=None,  # Dictionary of options to train various HiPPO parameters
+            lr=None,  # Hook to set LR of hippo parameters differently
+            length_correction=True,
+            # Multiply by I-A|^L after initialization; can be turned off for initialization speed
+            hurwitz=False,
+            tie_state=False,  # Tie parameters of HiPPO ODE across the H features
+            precision=1,  # 1 (single) or 2 (double) for the kernel
+            resample=False,
+            # If given inputs of different lengths, adjust the sampling rate. Note that L should always be provided in this case, as it assumes that L is the true underlying length of the continuous signal
+            verbose=False,
+    ):
+        super().__init__()
+        self.N = N
+        self.H = H
+        L = L or 1
+        self.precision = precision
+        dtype = torch.double if self.precision == 2 else torch.float
+        cdtype = torch.cfloat if dtype == torch.float else torch.cdouble
+        self.rate = None if resample else 1.0
+        self.channels = channels
+
+        # Generate dt
+        log_dt = torch.rand(self.H, dtype=dtype) * (
+                math.log(dt_max) - math.log(dt_min)
+        ) + math.log(dt_min)
+
+        w, p, B, _ = nplr(measure, self.N, rank, dtype=dtype)
+        C = torch.randn(channels, self.H, self.N // 2, dtype=cdtype)
+        self.kernel = SSKernelNPLR(
+            L, w, p, B, C,
+            log_dt,
+            hurwitz=hurwitz,
+            trainable=trainable,
+            lr=lr,
+            tie_state=tie_state,
+            length_correction=length_correction,
+            verbose=verbose,
+        )
+
+    def forward(self, L=None):
+        k, _ = self.kernel(rate=self.rate, L=L)
+        return k.float()
+
+    def step(self, u, state, **kwargs):
+        u, state = self.kernel.step(u, state, **kwargs)
+        return u.float(), state
+
+    def default_state(self, *args, **kwargs):
+        return self.kernel.default_state(*args, **kwargs)
+
 
 class S4(keras.layers.Layer):
 
@@ -57,7 +169,7 @@ class S4(keras.layers.Layer):
             channels *= 2
             self.hyper_activation = Activation(hyper_act)
 
-        self.D = nn.Parameter(torch.randn(channels, self.h))
+        self.D = tf.Variable(tf.random.normal([channels, self.h]))
 
         if self.bidirectional:
             channels *= 2
@@ -172,7 +284,7 @@ class S4Layer(keras.layers.Layer):
     # S4 Layer that can be used as a drop-in replacement for a TransformerEncoder
     def __init__(self, features, lmax, N=64, dropout=0.0, bidirectional=True, layer_norm=True):
         super().__init__()
-        self.s4_layer  = S4(d_model=features,
+        self.s4_layer = S4(d_model=features,
                             d_state=N,
                             l_max=lmax,
                             bidirectional=bidirectional)
@@ -182,7 +294,7 @@ class S4Layer(keras.layers.Layer):
 
     def forward(self, x):
         # x has shape seq, batch, feature
-        x = x.permute((1 ,2 ,0))  # batch, feature, seq (as expected from S4 with transposed=True)
+        x = x.permute((1,2,0))  # batch, feature, seq (as expected from S4 with transposed=True)
         xout, _ = self.s4_layer(x)  # batch, feature, seq
         xout = self.dropout(xout)
         xout = xout + x # skip connection   # batch, feature, seq

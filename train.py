@@ -33,8 +33,8 @@ def train(output_directory,
     #         diffusion_hyperparams[key] = diffusion_hyperparams[key]
 
     # predefine model
-    net = SSSDS4Imputer(**model_config)
-    print_size(net)
+    model = SSSDS4Imputer(**model_config)
+    model.summary()
 
     # define optimizer
     optimizer = torch.optim.Adam(net.parameters(), lr=learning_rate)
@@ -43,7 +43,7 @@ def train(output_directory,
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('-c', '--config', type=str, default='config/SSSDS4.json',
+    parser.add_argument('-c', '--config', type=str, default='configs/config_SSSDS4.json',
                         help='JSON file for configuration')
 
     args = parser.parse_args()
