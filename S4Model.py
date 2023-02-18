@@ -3,30 +3,132 @@ from tensorflow import keras
 from einops import rearrange
 from opt_einsum import contract
 import math
+import numpy as np
+from scipy import special as ss
+
+def embed_c2r(A):
+    A = rearrange(A, '... m n -> ... m () n ()')
+    A = np.pad(A, ((0, 0), (0, 1), (0, 0), (0, 1))) + \
+        np.pad(A, ((0, 0), (1, 0), (0, 0), (1,0)))
+    return rearrange(A, 'm x n y -> (m x) (n y)')
+
+def transition(measure, N, **measure_args):
+    """ A, B transition matrices for different measures
+    measure: the type of measure
+      legt - Legendre (translated)
+      legs - Legendre (scaled)
+      glagt - generalized Laguerre (translated)
+      lagt, tlagt - previous versions of (tilted) Laguerre with slightly different normalization
+    """
+    # Laguerre (translated)
+    if measure == 'lagt':
+        b = measure_args.get('beta', 1.0)
+        A = np.eye(N) / 2 - np.tril(np.ones((N, N)))
+        B = b * np.ones((N, 1))
+    # Generalized Laguerre
+    # alpha 0, beta small is most stable (limits to the 'lagt' measure)
+    # alpha 0, beta 1 has transition matrix A = [lower triangular 1]
+    elif measure == 'glagt':
+        alpha = measure_args.get('alpha', 0.0)
+        beta = measure_args.get('beta', 0.01)
+        A = -np.eye(N) * (1 + beta) / 2 - np.tril(np.ones((N, N)), -1)
+        B = ss.binom(alpha + np.arange(N), np.arange(N))[:, None]
+
+        L = np.exp(.5 * (ss.gammaln(np.arange(N)+alpha+1) - ss.gammaln(np.arange(N)+1)))
+        A = (1./L[:, None]) * A * L[None, :]
+        B = (1./L[:, None]) * B * np.exp(-.5 * ss.gammaln(1-alpha)) * beta**((1-alpha)/2)
+    # Legendre (translated)
+    elif measure == 'legt':
+        Q = np.arange(N, dtype=np.float64)
+        R = (2*Q + 1) ** .5
+        j, i = np.meshgrid(Q, Q)
+        A = R[:, None] * np.where(i < j, (-1.)**(i-j), 1) * R[None, :]
+        B = R[:, None]
+        A = -A
+    # Legendre (scaled)
+    elif measure == 'legs':
+        q = np.arange(N, dtype=np.float64)
+        col, row = np.meshgrid(q, q)
+        r = 2 * q + 1
+        M = -(np.where(row >= col, r, 0) - np.diag(q))
+        T = np.sqrt(np.diag(2 * q + 1))
+        A = T @ M @ np.linalg.inv(T)
+        B = np.diag(T)[:, None]
+        B = B.copy() # Otherwise "UserWarning: given NumPY array is not writeable..." after torch.as_tensor(B)
+    elif measure == 'fourier':
+        freqs = np.arange(N//2)
+        d = np.stack([freqs, np.zeros(N//2)], axis=-1).reshape(-1)[:-1]
+        A = 2*np.pi*(np.diag(d, 1) - np.diag(d, -1))
+        A = A - embed_c2r(np.ones((N//2, N//2)))
+        B = embed_c2r(np.ones((N//2, 1)))[..., :1]
+    elif measure == 'random':
+        A = np.random.randn(N, N) / N
+        B = np.random.randn(N, 1)
+    elif measure == 'diagonal':
+        A = -np.diag(np.exp(np.random.randn(N)))
+        B = np.random.randn(N, 1)
+    else:
+        raise NotImplementedError
+
+    return A, B
+
+def rank_correction(measure, N, rank=1, dtype=tf.dtypes.float32):
+    """ Return low-rank matrix L such that A + L is normal """
+
+    if measure == 'legs':
+        assert rank >= 1
+        P = tf.sqrt(.5+tf.range(N, dtype=dtype))
+        P = tf.expand_dims(P, axis=0) # (1 N)
+    elif measure == 'legt':
+        assert rank >= 2
+        P = tf.concat(1+2*tf.range(N, dtype=dtype)) # (N)
+        P0 = P.clone()
+        P0[0::2] = 0.
+        P1 = P.clone()
+        P1[1::2] = 0.
+        P = tf.stack([P0, P1], axis=0) # (2 N)
+    elif measure == 'lagt':
+        assert rank >= 1
+        P = .5**.5 * tf.ones(1, N, dtype=dtype)
+    elif measure == 'fourier':
+        P = tf.ones(N, dtype=dtype) # (N)
+        P0 = P.clone()
+        P0[0::2] = 0.
+        P1 = P.clone()
+        P1[1::2] = 0.
+        P = tf.stack([P0, P1], axis=0) # (2 N)
+    else: raise NotImplementedError
+
+    d = tf.shape(P)[0]
+    if rank > d:
+        P = tf.concat([P, tf.zeros(rank-d, N, dtype=dtype)], dim=0) # (rank N)
+    return P
 
 
-def nplr(measure, N, rank=1, dtype=torch.float):
+def nplr(measure, N, rank=1, dtype=tf.dtypes.float32):
     """ Return w, p, q, V, B such that
     (w - p q^*, B) is unitarily equivalent to the original HiPPO A, B by the matrix V
     i.e. A = V[w - p q^*]V^*, B = V B
     """
-    assert dtype == torch.float or torch.cfloat
+    assert dtype == tf.dtypes.float32 or tf.dtypes.complex64
     if measure == 'random':
-        dtype = torch.cfloat if dtype == torch.float else torch.cdouble
-        # w = torch.randn(N//2, dtype=dtype)
-        w = -torch.exp(torch.randn(N//2)) + 1j*torch.randn(N//2)
-        P = torch.randn(rank, N//2, dtype=dtype)
-        B = torch.randn(N//2, dtype=dtype)
-        V = torch.eye(N, dtype=dtype)[..., :N//2] # Only used in testing
+        dtype = tf.dtypes.complex64 if dtype == tf.dtypes.float32 else tf.dtypes.complex128
+        # w = tf.random.normal(N//2, dtype=dtype)
+        w = -tf.math.exp(tf.random.normal(N//2)) + 1j*tf.random.normal(N//2)
+        P = tf.random.normal(rank, N//2, dtype=dtype)
+        B = tf.random.normal(N//2, dtype=dtype)
+        V = tf.eye(N, dtype=dtype)[..., :N//2] # Only used in testing
         return w, P, B, V
 
     A, B = transition(measure, N)
-    A = torch.as_tensor(A, dtype=dtype) # (N, N)
-    B = torch.as_tensor(B, dtype=dtype)[:, 0] # (N,)
+    A = tf.convert_to_tensor(A, dtype=dtype) # (N, N)
+    B = tf.convert_to_tensor(B, dtype=dtype)[:, 0] # (N,)
 
     P = rank_correction(measure, N, rank=rank, dtype=dtype)
-    AP = A + torch.sum(P.unsqueeze(-2)*P.unsqueeze(-1), dim=-3)
-    w, V = torch.linalg.eig(AP) # (..., N) (..., N, N)
+    P_2 = tf.expand_dims(P, axis=-2) # P.unsqueeze(-2)
+    P_1 = tf.expand_dims(P, axis=-1) # P.unsqueeze(-1)
+    AP = A + tf.math.reduce_sum(P_2 * P_1, axis=-3)
+    w, V = tf.linalg.eig(AP) # (..., N) (..., N, N)
     # V w V^{-1} = A
 
     # Only keep one of the conjugate pairs
@@ -80,18 +182,19 @@ class HippoSSKernel(keras.layers.Layer):
         self.H = H
         L = L or 1
         self.precision = precision
-        dtype = torch.double if self.precision == 2 else torch.float
-        cdtype = torch.cfloat if dtype == torch.float else torch.cdouble
+        dtype = tf.dtypes.double if self.precision == 2 else tf.dtypes.float32
+        cdtype = tf.dtypes.complex64 if dtype == tf.dtypes.float32 else tf.dtypes.complex128
         self.rate = None if resample else 1.0
         self.channels = channels
 
         # Generate dt
-        log_dt = torch.rand(self.H, dtype=dtype) * (
+        # print('S4Model/HippoSSKernel: H=', self.H)
+        log_dt = tf.random.uniform([self.H], dtype=dtype) * (
                 math.log(dt_max) - math.log(dt_min)
         ) + math.log(dt_min)
 
         w, p, B, _ = nplr(measure, self.N, rank, dtype=dtype)
-        C = torch.randn(channels, self.H, self.N // 2, dtype=cdtype)
+        C = tf.random.normal(channels, self.H, self.N // 2, dtype=cdtype)
         self.kernel = SSKernelNPLR(
             L, w, p, B, C,
             log_dt,
@@ -175,6 +278,7 @@ class S4(keras.layers.Layer):
             channels *= 2
 
         # SSM Kernel
+        # print('S4Model/S4: h=', self.h)
         self.kernel = HippoSSKernel(self.h, N=self.n, L=l_max, channels=channels, verbose=verbose, **kernel_args)
 
         # Pointwise
@@ -195,7 +299,7 @@ class S4(keras.layers.Layer):
 
         # self.time_transformer = get_torch_trans(heads=8, layers=1, channels=self.h)
 
-    def forward(self, u, **kwargs):  # absorbs return_output and transformer src mask
+    def call(self, u, **kwargs):  # absorbs return_output and transformer src mask
         """
         u: (B H L) if self.transposed else (B L H)
         state: (H N) never needed unless you know what you're doing
@@ -255,11 +359,14 @@ class S4(keras.layers.Layer):
         assert not self.training
 
         y, next_state = self.kernel.step(u, state)  # (B C H)
-        y = y + u.unsqueeze(-2) * self.D
+        u_2 = tf.expand_dims(u, axis=-2) # u.unsqueeze(-2)
+        y = y + u_2 * self.D
         y = rearrange(y, '... c h -> ... (c h)')
         y = self.activation(y)
         if self.transposed:
-            y = self.output_linear(y.unsqueeze(-1)).squeeze(-1)
+            y_1 = tf.expand(y, axis=-1) # y.unsqueeze(-1)
+            y = self.output_linear( y_1 )
+            y = tf.squeeze(y, axis=-1) # .squeeze(-1)
         else:
             y = self.output_linear(y)
         return y, next_state
@@ -284,6 +391,7 @@ class S4Layer(keras.layers.Layer):
     # S4 Layer that can be used as a drop-in replacement for a TransformerEncoder
     def __init__(self, features, lmax, N=64, dropout=0.0, bidirectional=True, layer_norm=True):
         super().__init__()
+        # print('S4Model/S4Layer: features=', features)
         self.s4_layer = S4(d_model=features,
                             d_state=N,
                             l_max=lmax,
@@ -292,7 +400,7 @@ class S4Layer(keras.layers.Layer):
         self.norm_layer = keras.layers.LayerNormalization(features) if layer_norm else keras.layers.Identity()
         self.dropout = keras.layers.SpatialDropout2D(dropout) if dropout >0 else keras.layers.Identity()
 
-    def forward(self, x):
+    def call(self, x):
         # x has shape seq, batch, feature
         x = x.permute((1,2,0))  # batch, feature, seq (as expected from S4 with transposed=True)
         xout, _ = self.s4_layer(x)  # batch, feature, seq

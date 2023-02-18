@@ -17,7 +17,7 @@ class Residual_block(keras.layers.Layer):
         self.res_channels = res_channels
 
         self.fc_t = keras.layers.Dense(self.res_channels)
-
+        # print('SSSDS4Imputers/Residual_block: res_channels=', self.res_channels)
         self.S41 = S4Layer(features=2 * self.res_channels,
                            lmax=s4_lmax,
                            N=s4_d_state,
