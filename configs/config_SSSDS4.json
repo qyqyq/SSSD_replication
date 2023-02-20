@@ -32,8 +32,8 @@
         "missing_k": 90
     },
     "trainset_config":{
-        "train_data_path": "../SSSD/datasets/train_mujoco.npy",
-        "test_data_path": "../SSSD/datasets/test_mujoco.npy",
+        "train_data_path": "./datasets/train_mujoco.npy",
+        "test_data_path": "./datasets/test_mujoco.npy",
         "segment_length":100,
         "sampling_rate": 100
     },
