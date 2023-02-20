@@ -4,16 +4,6 @@ import random
 import tensorflow as tf
 
 
-
-
-
-
-
-
-
-
-
-
 def flatten(v):
     """
     Flatten a list of lists/tuples
@@ -47,28 +37,7 @@ def find_max_epoch(path):
     return epoch
 
 
-def print_size(net):
-    """
-    Print the number of parameters of a network
-    """
-
-    if net is not None and isinstance(net, torch.nn.Module):
-        module_parameters = filter(lambda p: p.requires_grad, net.parameters())
-        params = sum([np.prod(p.size()) for p in module_parameters])
-        print("{} Parameters: {:.6f}M".format(
-            net.__class__.__name__, params / 1e6), flush=True)
-
-
 # Utilities for diffusion models
-
-def std_normal(size):
-    """
-    Generate the standard Gaussian variable of a certain size
-    """
-
-    return torch.normal(0, 1, size=size).cuda()
-
-
 def calc_diffusion_step_embedding(diffusion_steps, diffusion_step_embed_dim_in):
     """
     Embed a diffusion step $t$ into a higher dimensional space
@@ -84,13 +53,14 @@ def calc_diffusion_step_embedding(diffusion_steps, diffusion_step_embed_dim_in):
     Returns:
     the embedding vectors (torch.tensor, shape=(batchsize, diffusion_step_embed_dim_in)):
     """
-
+    # print('util | calc_diffusion_step_embedding | diffusion_steps', diffusion_steps)
+    # print('util | calc_diffusion_step_embedding | diffusion_step_embed_dim_in', diffusion_step_embed_dim_in)
     assert diffusion_step_embed_dim_in % 2 == 0
 
     half_dim = diffusion_step_embed_dim_in // 2
     _embed = np.log(10000) / (half_dim - 1)
-    _embed = tf.math.exp(tf.range(half_dim) * -_embed)
-    _embed = diffusion_steps * _embed
+    _embed = tf.math.exp(tf.range(half_dim, dtype=_embed.dtype) * -_embed)
+    _embed = tf.cast(diffusion_steps, dtype=_embed.dtype) * _embed
     diffusion_step_embed = tf.concat((tf.math.sin(_embed),
                                       tf.math.cos(_embed)), 1)
 
@@ -153,7 +123,7 @@ def sampling(net, size, diffusion_hyperparams, cond, mask, only_generate_missing
 
     print('begin sampling, total number of reverse steps = %s' % T)
 
-    x = std_normal(size)
+    x = tf.random.normal(size)
 
     with torch.no_grad():
         for t in range(T - 1, -1, -1):
@@ -162,14 +132,14 @@ def sampling(net, size, diffusion_hyperparams, cond, mask, only_generate_missing
             diffusion_steps = (t * torch.ones((size[0], 1))).cuda()  # use the corresponding reverse step
             epsilon_theta = net((x, cond, mask, diffusion_steps,))  # predict \epsilon according to \epsilon_\theta
             # update x_{t-1} to \mu_\theta(x_t)
-            x = (x - (1 - Alpha[t]) / torch.sqrt(1 - Alpha_bar[t]) * epsilon_theta) / torch.sqrt(Alpha[t])
+            x = (x - (1 - Alpha[t]) / tf.math.sqrt(1 - Alpha_bar[t]) * epsilon_theta) / tf.math.sqrt(Alpha[t])
             if t > 0:
-                x = x + Sigma[t] * std_normal(size)  # add the variance term to x_{t-1}
+                x = x + Sigma[t] * tf.random.normal(size)  # add the variance term to x_{t-1}
 
     return x
 
 
-def training_loss(net, loss_fn, X, diffusion_hyperparams, only_generate_missing=1):
+def training_loss(net, X, diffusion_hyperparams, only_generate_missing=1):
     """
     Compute the training loss of epsilon and epsilon_theta
 
@@ -193,34 +163,36 @@ def training_loss(net, loss_fn, X, diffusion_hyperparams, only_generate_missing=
     loss_mask = X[3]
 
     B, C, L = audio.shape  # B is batchsize, C=1, L is audio length
-    diffusion_steps = torch.randint(T, size=(B, 1, 1)).cuda()  # randomly sample diffusion steps from 1~T
+    diffusion_steps = tf.experimental.numpy.random.randint(low=1, high=T, size=(B, 1, 1))  # randomly sample diffusion steps from 1~T
 
-    z = std_normal(audio.shape)
+    z = tf.random.normal(audio.shape)
     if only_generate_missing == 1:
-        z = audio * mask.float() + z * (1 - mask).float()
-    transformed_X = torch.sqrt(Alpha_bar[diffusion_steps]) * audio + torch.sqrt(
-        1 - Alpha_bar[diffusion_steps]) * z  # compute x_t from q(x_t|x_0)
-    epsilon_theta = net(
-        (transformed_X, cond, mask, diffusion_steps.view(B, 1),))  # predict \epsilon according to \epsilon_\theta
-
+        z = audio * mask + z * (1 - mask)
+    transformed_X = tf.math.sqrt(tf.Variable(Alpha_bar[diffusion_steps], dtype=tf.dtypes.float32)) * audio + tf.math.sqrt(
+        tf.Variable(1 - Alpha_bar[diffusion_steps], dtype=tf.dtypes.float32)) * z  # compute x_t from q(x_t|x_0)
+    # epsilon_theta = net(
+    #     (transformed_X, cond, mask, diffusion_steps.view(B, 1),))  # predict \epsilon according to \epsilon_\theta
+    # print('util | training_loss | transformed_X.shape: ', transformed_X.shape)
+    # print('util | training_loss | z.shape: ', z.shape)
+    # noise, conditional, mask, diffusion_steps = input_data
     if only_generate_missing == 1:
-        return loss_fn(epsilon_theta[loss_mask], z[loss_mask])
+        return net.train_on_batch( x=(transformed_X, cond, mask, tf.squeeze(diffusion_steps, axis=2)), y=z*loss_mask )
+        # return loss_fn(epsilon_theta[loss_mask], z[loss_mask])
     elif only_generate_missing == 0:
-        return loss_fn(epsilon_theta, z)
+        return net.train_on_batch( x=(transformed_X, cond, mask, tf.squeeze(diffusion_steps, axis=2)), y=z )
+        # return loss_fn(epsilon_theta, z)
 
 
 def get_mask_rm(sample, k):
     """Get mask of random points (missing at random) across channels based on k,
     where k == number of data points. Mask of sample's shape where 0's to be imputed, and 1's to preserved
     as per ts imputers"""
-
-    mask = torch.ones(sample.shape)
-    length_index = torch.tensor(range(mask.shape[0]))  # lenght of series indexes
+    mask = np.ones(sample.shape)
+    length_index = range(mask.shape[0])  # lenght of series indexes
     for channel in range(mask.shape[1]):
-        perm = torch.randperm(len(length_index))
+        perm = np.random.permutation(len(length_index))
         idx = perm[0:k]
         mask[:, channel][idx] = 0
-
     return mask
 
 
@@ -228,14 +200,12 @@ def get_mask_mnr(sample, k):
     """Get mask of random segments (non-missing at random) across channels based on k,
     where k == number of segments. Mask of sample's shape where 0's to be imputed, and 1's to preserved
     as per ts imputers"""
-
-    mask = torch.ones(sample.shape)
-    length_index = torch.tensor(range(mask.shape[0]))
-    list_of_segments_index = torch.split(length_index, k)
+    mask = np.ones(sample.shape)
+    length_index = range(mask.shape[0])
+    list_of_segments_index = np.array_split(length_index, k)
     for channel in range(mask.shape[1]):
         s_nan = random.choice(list_of_segments_index)
         mask[:, channel][s_nan[0]:s_nan[-1] + 1] = 0
-
     return mask
 
 
@@ -243,12 +213,10 @@ def get_mask_bm(sample, k):
     """Get mask of same segments (black-out missing) across channels based on k,
     where k == number of segments. Mask of sample's shape where 0's to be imputed, and 1's to be preserved
     as per ts imputers"""
-
-    mask = torch.ones(sample.shape)
-    length_index = torch.tensor(range(mask.shape[0]))
-    list_of_segments_index = torch.split(length_index, k)
+    mask = np.ones(sample.shape)
+    length_index = range(mask.shape[0])
+    list_of_segments_index = np.array_split(length_index, k)
     s_nan = random.choice(list_of_segments_index)
     for channel in range(mask.shape[1]):
         mask[:, channel][s_nan[0]:s_nan[-1] + 1] = 0
-
     return mask

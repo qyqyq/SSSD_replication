@@ -1,10 +1,51 @@
 import tensorflow as tf
 from tensorflow import keras
 from einops import rearrange, repeat
-from opt_einsum import contract
+from opt_einsum import contract, contract_expression
 import math
 import numpy as np
 from scipy import special as ss
+
+
+def power(L, A, v=None):
+    """ Compute A^L and the scan sum_i A^i v_i
+    A: (..., N, N)
+    v: (..., N, L)
+    """
+    I = tf.eye(A.shape[-1], dtype=A.dtype) # , dtype=A.dtype, device=A.device)
+
+    powers = [A]
+    l = 1
+    while True:
+        if L % 2 == 1: I = powers[-1] @ I
+        L //= 2
+        if L == 0: break
+        l *= 2
+        powers.append(powers[-1] @ powers[-1])
+
+    if v is None: return I
+
+    # Invariants:
+    # powers[-1] := A^l
+    # l := largest po2 at most L
+
+    # Note that an alternative divide and conquer to compute the reduction is possible and can be embedded into the above loop without caching intermediate powers of A
+    # We do this reverse divide-and-conquer for efficiency reasons:
+    # 1) it involves fewer padding steps for non-po2 L
+    # 2) it involves more contiguous arrays
+
+    # Take care of edge case for non-po2 arrays
+    # Note that this initial step is a no-op for the case of power of 2 (l == L)
+    k = v.shape[-1] - l
+    v_ = powers.pop() @ v[..., l:]
+    v = v[..., :l]
+    v[..., :k] = v[..., :k] + v_
+
+    # Handle reduction for power of 2
+    while v.shape[-1] > 1:
+        v = rearrange(v, '... (z l) -> ... z l', z=2)
+        v = v[..., 0, :] + powers.pop() @ v[..., 1, :]
+    return I, v.squeeze(-1)
 
 def embed_c2r(A):
     A = rearrange(A, '... m n -> ... m () n ()')
@@ -54,7 +95,7 @@ def transition(measure, N, **measure_args):
         T = np.sqrt(np.diag(2 * q + 1))
         A = T @ M @ np.linalg.inv(T)
         B = np.diag(T)[:, None]
-        B = B.copy() # Otherwise "UserWarning: given NumPY array is not writeable..." after torch.as_tensor(B)
+        B = B.copy() # Otherwise "UserWarning: given NumPY array is not writeable..." after t.as_tensor(B)
     elif measure == 'fourier':
         freqs = np.arange(N//2)
         d = np.stack([freqs, np.zeros(N//2)], axis=-1).reshape(-1)[:-1]
@@ -125,8 +166,8 @@ def nplr(measure, N, rank=1, dtype=tf.dtypes.float32):
     B = tf.convert_to_tensor(B, dtype=dtype)[:, 0] # (N,)
 
     P = rank_correction(measure, N, rank=rank, dtype=dtype)
-    P_2 = tf.expand_dims(P, axis=-2) # P.unsqueeze(-2)
-    P_1 = tf.expand_dims(P, axis=-1) # P.unsqueeze(-1)
+    P_2 = tf.expand_dims(P, axis=-2)
+    P_1 = tf.expand_dims(P, axis=-1)
     AP = A + tf.math.reduce_sum(P_2 * P_1, axis=-3)
     w, V = tf.linalg.eig(AP) # (..., N) (..., N, N)
     # V w V^{-1} = A
@@ -152,8 +193,15 @@ def nplr(measure, N, rank=1, dtype=tf.dtypes.float32):
 
 
 
+
+
 _c2r = lambda x: tf.stack( [tf.math.real(x), tf.math.imag(x)], axis=-1 )
 _r2c = lambda x: tf.complex( x[...,0], x[...,1] )
+_conj = lambda x: tf.concat( [x, tf.math.conj(x)], axis=-1 )
+_resolve_conj = lambda x: tf.math.conj(x)
+# v, w: (..., N); z: (..., L); returns: (..., L)
+_cauchy_slow = lambda v,z,w: tf.reduce_sum( ( tf.expand_dims(v,axis=-1) /
+                                              ( tf.expand_dims(z,axis=-2)-tf.expand_dims(w,axis=-1) ) ), axis=-2 )
 
 class SSKernelNPLR(keras.layers.Layer):
     """Stores a representation of and computes the SSKernel function K_L(A^dt, B^dt, C) corresponding to a discretized state space, where A is Normal + Low Rank (NPLR)
@@ -168,7 +216,7 @@ class SSKernelNPLR(keras.layers.Layer):
     (... L) that represents represents FFT SSKernel_L(A^dt, B^dt, C)
     """
 
-    # @torch.no_grad()
+    # @t.no_grad()
     def _setup_C(self, double_length=False):
         """ Construct C~ from C
         double_length: current C is for length L, convert it to length 2L
@@ -178,11 +226,13 @@ class SSKernelNPLR(keras.layers.Layer):
         dA_L = power(self.L, self.dA)
         # Multiply C by I - dA_L
         C_ = _conj(C)
-        prod = contract("h m n, c h n -> c h m", dA_L.transpose(-1, -2), C_)
+        # print('S4Model | _setup_C | dA_L.shape:', dA_L.shape)
+        prod = contract("h m n, c h n -> c h m", tf.transpose(dA_L, perm=[0,2,1]), C_)
         if double_length: prod = -prod # Multiply by I + dA_L instead
         C_ = C_ - prod
         C_ = C_[..., :self.N] # Take conjugate pairs again
-        self.C.copy_(_c2r(C_))
+
+        self.C = tf.Variable(_c2r(C_))
 
         if double_length:
             self.L *= 2
@@ -191,14 +241,14 @@ class SSKernelNPLR(keras.layers.Layer):
     def _omega(self, L, dtype, device, cache=True):
         """ Calculate (and cache) FFT nodes and their "unprocessed" them with the bilinear transform
         This should be called everytime the internal length self.L changes """
-        omega = tf.convert_to_tensor(np.exp(-2j * np.pi / (L)), dtype=dtype)  # \omega_{2L}
-        print('omega:', omega)
-        print('L:', L)
-        omega = omega ** tf.range(0, L // 2 + 1)
+        omega_x = tf.convert_to_tensor(np.exp(-2j * np.pi / (L)), dtype=dtype)  # \omega_{2L}
+        # print('omega_x:', omega_x)
+        omega_y = tf.convert_to_tensor(np.arange(0, L // 2 + 1), dtype=dtype)
+        # print('omega_y:', omega_y)
+        omega = omega_x ** omega_y
         z = 2 * (1 - omega) / (1 + omega)
-        if cache:
-            self.register_buffer("omega", _c2r(omega))
-            self.register_buffer("z", _c2r(z))
+        self.omega = tf.Variable(_c2r(omega), trainable=False)
+        self.z = tf.Variable(_c2r(z), trainable=False)
         return omega, z
 
     def __init__(
@@ -255,25 +305,24 @@ class SSKernelNPLR(keras.layers.Layer):
         # Register parameters
         # C is a regular parameter, not state
         # self.C = nn.Parameter(_c2r(C.conj().resolve_conj()))
-        self.C = nn.Parameter(_c2r(_resolve_conj(C)))
+        self.C = tf.Variable(_c2r(_resolve_conj(C)))
         train = False
         if trainable is None: trainable = {}
         if trainable == False: trainable = {}
         if trainable == True: trainable, train = {}, True
-        self.register("log_dt", log_dt, trainable.get('dt', train), lr, 0.0)
-        self.register("B", _c2r(B), trainable.get('B', train), lr, 0.0)
-        self.register("P", _c2r(P), trainable.get('P', train), lr, 0.0)
+        self.log_dt = tf.Variable(log_dt, trainable=False)
+        self.B = tf.Variable(_c2r(B), trainable=False)
+        self.P = tf.Variable(_c2r(P), trainable=False)
         if self.hurwitz:
             log_w_real = tf.math.log(-w.real + 1e-3) # Some of the HiPPO methods have real part 0
             w_imag = w.imag
-            self.register("log_w_real", log_w_real, trainable.get('A', 0), lr, 0.0)
-            self.register("w_imag", w_imag, trainable.get('A', train), lr, 0.0)
+            self.log_w_real = tf.Variable(log_w_real, trainable=False)
+            self.w_imag = tf.Variable(w_imag, trainable=False)
             self.Q = None
         else:
-            self.register("w", _c2r(w), trainable.get('A', train), lr, 0.0)
-            # self.register("Q", _c2r(P.clone().conj().resolve_conj()), trainable.get('P', train), lr, 0.0)
-            Q = _resolve_conj(P.clone())
-            self.register("Q", _c2r(Q), trainable.get('P', train), lr, 0.0)
+            self.w = tf.Variable(_c2r(w), trainable=False)
+            Q = _resolve_conj( tf.identity(P) )
+            self.Q = tf.Variable(_c2r(Q), trainable=False)
 
         if length_correction:
             self._setup_C()
@@ -281,7 +330,7 @@ class SSKernelNPLR(keras.layers.Layer):
     def _w(self):
         # Get the internal w (diagonal) parameter
         if self.hurwitz:
-            w_real = -torch.exp(self.log_w_real)
+            w_real = -tf.math.exp(self.log_w_real)
             w_imag = self.w_imag
             w = w_real + 1j * w_imag
         else:
@@ -304,10 +353,10 @@ class SSKernelNPLR(keras.layers.Layer):
             L = int(self.L / rate)
 
         # Increase the internal length if needed
-        while rate * L > self.L:
-            self.double_length()
+        # while rate * L > self.L:
+        #     self.double_length()
 
-        dt = torch.exp(self.log_dt) * rate
+        dt = tf.math.exp(self.log_dt) * rate
         B = _r2c(self.B)
         C = _r2c(self.C)
         P = _r2c(self.P)
@@ -331,36 +380,39 @@ class SSKernelNPLR(keras.layers.Layer):
             # Compute 1/dt * (I + dt/2 A) @ state
 
             # Can do this without expanding (maybe minor speedup using conj symmetry in theory), but it's easier to read this way
-            s = _conj(state) if state.size(-1) == self.N else state # (B H N)
+            s = _conj(state) if state.shape[-1] == self.N else state # (B H N)
             sA = (
                 s * _conj(w) # (B H N)
                 - contract('bhm, rhm, rhn -> bhn', s, _conj(Q), _conj(P))
             )
-            s = s / dt.unsqueeze(-1) + sA / 2
+            s = s / tf.expand_dims(dt, axis=-1) + sA / 2
             s = s[..., :self.N]
 
-            B = torch.cat([s, B], dim=-3)  # (s+1, H, N)
+            B = tf.concat([s, B], dim=-3)  # (s+1, H, N)
 
         # Incorporate dt into A
-        w = w * dt.unsqueeze(-1)  # (H N)
+        w = w * tf.cast(tf.expand_dims(dt, axis=-1), dtype=w.dtype)  # (H N)
 
         # Stack B and p, C and q for convenient batching
-        B = torch.cat([B, P], dim=-3) # (s+1+r, H, N)
-        C = torch.cat([C, Q], dim=-3) # (c+r, H, N)
+        B = tf.concat([B, P], axis=-3) # (s+1+r, H, N)
+        C = tf.concat([C, Q], axis=-3) # (c+r, H, N)
 
         # Incorporate B and C batch dimensions
-        v = B.unsqueeze(-3) * C.unsqueeze(-4)  # (s+1+r, c+r, H, N)
+        v = tf.expand_dims(B, axis=-3) * tf.expand_dims(C, axis=-4)  # (s+1+r, c+r, H, N)
         # w = w[None, None, ...]  # (1, 1, H, N)
         # z = z[None, None, None, ...]  # (1, 1, 1, L)
 
         # Calculate resolvent at omega
-        if has_cauchy_extension and z.dtype == torch.cfloat:
-            r = cauchy_mult(v, z, w, symmetric=True)
-        elif has_pykeops:
-            r = cauchy_conj(v, z, w)
-        else:
-            r = cauchy_slow(v, z, w)
-        r = r * dt[None, None, :, None]  # (S+1+R, C+R, H, L)
+        # if has_cauchy_extension and z.dtype == tf.dtypes.complex64:
+        #     r = cauchy_mult(v, z, w, symmetric=True)
+        # elif has_pykeops:
+        #     r = cauchy_conj(v, z, w)
+        # else:
+        #     r = cauchy_slow(v, z, w)
+        r = _cauchy_slow(v, z, w)
+        # print('S4Model | SSKernelNPLR | r:', r)
+        # print('S4Model | SSKernelNPLR | dt:', dt)
+        r = r * tf.cast( tf.reshape(dt, shape=[1,1,-1,1]), r.dtype )  # (S+1+R, C+R, H, L)
 
         # Low-rank Woodbury correction
         if self.rank == 1:
@@ -385,9 +437,9 @@ class SSKernelNPLR(keras.layers.Layer):
             r10 = r[-self.rank:, :-self.rank, :, :]
             r11 = r[-self.rank:, -self.rank:, :, :]
             r11 = rearrange(r11, "a b h n -> h n a b")
-            r11 = torch.linalg.inv(torch.eye(self.rank, device=r.device) + r11)
+            r11 = tf.linalg.inv(tf.eye(self.rank, device=r.device) + r11)
             r11 = rearrange(r11, "h n a b -> a b h n")
-            k_f = r00 - torch.einsum("i j h n, j k h n, k l h n -> i l h n", r01, r11, r10)
+            k_f = r00 - tf.einsum("i j h n, j k h n, k l h n -> i l h n", r01, r11, r10)
 
         # Final correction for the bilinear transform
         k_f = k_f * 2 / (1 + omega)
@@ -405,7 +457,7 @@ class SSKernelNPLR(keras.layers.Layer):
         k_B = k[-1, :, :, :] # (C H L)
         return k_B, k_state
 
-    # @torch.no_grad()
+    # @t.no_grad()
     def double_length(self):
         if self.verbose: log.info(f"S4: Doubling length from L = {self.L} to {2*self.L}")
         self._setup_C(double_length=True)
@@ -418,12 +470,14 @@ class SSKernelNPLR(keras.layers.Layer):
         Q = P.conj() if self.Q is None else _r2c(self.Q)
 
         # Prepare Linear stepping
-        dt = torch.exp(self.log_dt)
-        D = (2.0 / dt.unsqueeze(-1) - w).reciprocal()  # (H, N)
-        R = (torch.eye(self.rank, dtype=w.dtype, device=w.device) + 2*contract('r h n, h n, s h n -> h r s', Q, D, P).real) # (H r r)
+        dt = tf.math.exp(self.log_dt)
+        D = tf.math.reciprocal( tf.cast(2.0 / tf.expand_dims(dt, axis=-1), dtype=w.dtype) - w)  # (H, N)
+        # R = ( tf.eye(self.rank, dtype=w.dtype) + 2* tf.math.real(contract('r h n, h n, s h n -> h r s', Q, D, P)) ) # (H r r)
+        R = ( tf.eye(self.rank) + 2* tf.math.real(contract('r h n, h n, s h n -> h r s', Q, D, P)) ) # (H r r)
         Q_D = rearrange(Q*D, 'r h n -> h r n')
-        R = torch.linalg.solve(R.to(Q_D), Q_D) # (H r N)
+        R = tf.linalg.solve(tf.cast(R, dtype=Q_D.dtype), Q_D) # (H r N)
         R = rearrange(R, 'h r n -> r h n')
+        E = tf.cast(2.0 / tf.expand_dims(dt, axis=-1), dtype=w.dtype) + w
 
         self.step_params = {
             "D": D, # (H N)
@@ -431,7 +485,7 @@ class SSKernelNPLR(keras.layers.Layer):
             "P": P, # (r H N)
             "Q": Q, # (r H N)
             "B": B, # (1 H N)
-            "E": 2.0 / dt.unsqueeze(-1) + w, # (H N)
+            "E": E, # (H N)
         }
 
     def _step_state_linear(self, u=None, state=None):
@@ -446,19 +500,21 @@ class SSKernelNPLR(keras.layers.Layer):
         C = _r2c(self.C) # View used for dtype/device
 
         if u is None: # Special case used to find dA
-            u = torch.zeros(self.H, dtype=C.dtype, device=C.device)
+            u = tf.zeros(self.H, dtype=C.dtype)
         if state is None: # Special case used to find dB
-            state = torch.zeros(self.H, self.N, dtype=C.dtype, device=C.device)
+            state = tf.zeros([self.H, self.N], dtype=C.dtype)
 
         step_params = self.step_params.copy()
-        if state.size(-1) == self.N: # Only store half of the conjugate pairs; should be true by default
+        if state.shape[-1] == self.N: # Only store half of the conjugate pairs; should be true by default
             # There should be a slightly faster way using conjugate symmetry
             contract_fn = lambda p, x, y: contract('r h n, r h m, ... h m -> ... h n', _conj(p), _conj(x), _conj(y))[..., :self.N] # inner outer product
+            contract_fn1 = contract_fn
         else:
-            assert state.size(-1) == 2*self.N
+            assert state.shape[-1] == 2*self.N
             step_params = {k: _conj(v) for k, v in step_params.items()}
             # TODO worth setting up a contract_expression in default_state if we want to use this at inference time for stepping
             contract_fn = lambda p, x, y: contract('r h n, r h m, ... h m -> ... h n', p, x, y) # inner outer product
+            contract_fn1 = lambda p, x, y: contract('r h n, r h m, ... 1 m -> ... h n', p, x, y)  # inner outer product
         D = step_params["D"]  # (H N)
         E = step_params["E"]  # (H N)
         R = step_params["R"]  # (r H N)
@@ -466,8 +522,8 @@ class SSKernelNPLR(keras.layers.Layer):
         Q = step_params["Q"]  # (r H N)
         B = step_params["B"]  # (1 H N)
 
-        new_state = E * state - contract_fn(P, Q, state) # (B H N)
-        new_state = new_state + 2.0 * B * u.unsqueeze(-1)  # (B H N)
+        new_state = E * state - contract_fn1(P, Q, state) # (B H N)
+        new_state = new_state + 2.0 * B * tf.expand_dims(u, axis=-1)  # (B H N)
         new_state = D * (new_state - contract_fn(P, R, new_state))
 
         return new_state
@@ -479,12 +535,12 @@ class SSKernelNPLR(keras.layers.Layer):
         self._setup_linear()
         C = _r2c(self.C) # Just returns a view that we use for finding dtype/device
 
-        state = torch.eye(2*self.N, dtype=C.dtype, device=C.device).unsqueeze(-2) # (N 1 N)
+        state = tf.expand_dims( tf.eye(2*self.N, dtype=C.dtype) , axis=-2)   # (N 1 N)
         dA = self._step_state_linear(state=state)
         dA = rearrange(dA, "n h m -> h m n")
         self.dA = dA # (H N N)
 
-        u = C.new_ones(self.H)
+        u = tf.ones(self.H, dtype=C.dtype)
         dB = self._step_state_linear(u=u)
         dB = _conj(dB)
         self.dB = rearrange(dB, '1 h n -> h n') # (H N)
@@ -501,12 +557,12 @@ class SSKernelNPLR(keras.layers.Layer):
 
         # Calculate original C
         dA_L = power(self.L, self.dA)
-        I = torch.eye(self.dA.size(-1)).to(dA_L)
+        I = tf.eye(self.dA.shape[-1]).to(dA_L)
         C = _conj(_r2c(self.C)) # (H C N)
 
-        dC = torch.linalg.solve(
+        dC = tf.linalg.solve(
             I - dA_L.transpose(-1, -2),
-            C.unsqueeze(-1),
+            tf.expand_dims(C, axis=-1),
         ).squeeze(-1)
         self.dC = dC
 
@@ -519,8 +575,8 @@ class SSKernelNPLR(keras.layers.Layer):
             self.dC = 2*self.dC[:, :, :self.N]
         elif mode == 'diagonal':
             # Eigendecomposition of the A matrix
-            L, V = torch.linalg.eig(self.dA)
-            V_inv = torch.linalg.inv(V)
+            L, V = tf.linalg.eig(self.dA)
+            V_inv = tf.linalg.inv(V)
             # Check that the eigendedecomposition is correct
             if self.verbose:
                 print("Diagonalization error:", torch.dist(V @ torch.diag_embed(L) @ V_inv, self.dA))
@@ -537,8 +593,8 @@ class SSKernelNPLR(keras.layers.Layer):
 
     def default_state(self, *batch_shape):
         C = _r2c(self.C)
-        N = C.size(-1)
-        H = C.size(-2)
+        N = C.shape[-1]
+        H = C.shape[-2]
 
         # Cache the tensor contractions we will later do, for efficiency
         # These are put in this function because they depend on the batch size
@@ -571,7 +627,7 @@ class SSKernelNPLR(keras.layers.Layer):
             batch_shape + (H, N),
         )
 
-        state = torch.zeros(*batch_shape, H, N, dtype=C.dtype, device=C.device)
+        state = tf.zeros(*batch_shape, H, N, dtype=C.dtype, device=C.device)
         return state
 
     def step(self, u, state):
@@ -583,22 +639,6 @@ class SSKernelNPLR(keras.layers.Layer):
             new_state = self._step_state(u, state)
         y = self.output_contraction(self.dC, new_state)
         return y, new_state
-
-    def register(self, name, tensor, trainable=False, lr=None, wd=None):
-        """Utility method: register a tensor as a buffer or trainable parameter"""
-
-        if trainable:
-            self.register_parameter(name, nn.Parameter(tensor))
-        else:
-            self.register_buffer(name, tensor)
-
-        optim = {}
-        if trainable and lr is not None:
-            optim["lr"] = lr
-        if trainable and wd is not None:
-            optim["weight_decay"] = wd
-        if len(optim) > 0:
-            setattr(getattr(self, name), "_optim", optim)
 
 
 
@@ -665,20 +705,124 @@ class HippoSSKernel(keras.layers.Layer):
             verbose=verbose,
         )
 
-    def forward(self, L=None):
-        k, _ = self.kernel(rate=self.rate, L=L)
-        return k.float()
+    def call(self, L=None):
+        k, _ = self.kernel(state=None, rate=self.rate, L=L)
+        return tf.cast(k, dtype=tf.float32)
 
     def step(self, u, state, **kwargs):
         u, state = self.kernel.step(u, state, **kwargs)
-        return u.float(), state
+        return tf.cast(u, dtype=tf.float32), state
 
     def default_state(self, *args, **kwargs):
         return self.kernel.default_state(*args, **kwargs)
 
 
-class S4(keras.layers.Layer):
+class Identity(keras.layers.Layer):
+    def __init__(self, **kwargs):
+        super(Identity, self).__init__(**kwargs)
+    def call(self, x):
+        return x
+def Activation(activation=None, dim=-1):
+    if activation in [ None, 'id', 'identity', 'linear' ]:
+        return Identity()
+    elif activation == 'tanh':
+        return keras.layers.Activation('tanh')
+    elif activation == 'relu':
+        return keras.layers.Activation('relu')
+    elif activation == 'gelu':
+        return keras.layers.Activation('gelu')
+    elif activation in ['swish', 'silu']:
+        keras.layers.Activation('swish')
+    elif activation == 'glu':
+        return lambda x: tf.multiply( tf.split(split_dim=dim,num_split=2,value=x)[0],
+                                      tf.sigmoid( tf.split(split_dim=dim,num_split=2,value=x)[1] ) )
+    elif activation == 'sigmoid':
+        return keras.layers.Activation('sigmoid')
+    else:
+        raise NotImplementedError("hidden activation '{}' is not implemented".format(activation))
 
+
+
+def get_initializer(name, activation=None):
+    if activation in [ None, 'id', 'identity', 'linear', 'modrelu' ]:
+        nonlinearity = 'linear'
+    elif activation in ['relu', 'tanh', 'sigmoid']:
+        nonlinearity = activation
+    elif activation in ['gelu', 'swish', 'silu']:
+        nonlinearity = 'relu' # Close to ReLU so approximate with ReLU's gain
+    else:
+        raise NotImplementedError(f"get_initializer: activation {activation} not supported")
+
+    if name == 'uniform':
+        initializer = partial(torch.nn.init.kaiming_uniform_, nonlinearity=nonlinearity)
+    elif name == 'normal':
+        initializer = partial(torch.nn.init.kaiming_normal_, nonlinearity=nonlinearity)
+    elif name == 'xavier':
+        initializer = torch.nn.init.xavier_normal_
+    elif name == 'zero':
+        initializer = partial(torch.nn.init.constant_, val=0)
+    elif name == 'one':
+        initializer = partial(torch.nn.init.constant_, val=1)
+    else:
+        raise NotImplementedError(f"get_initializer: initializer type {name} not supported")
+
+    return initializer
+
+class TransposedLinear(keras.layers.Layer):
+    """ Linear module on the second-to-last dimension """
+    def __init__(self, d_input, d_output, use_bias=True):
+        self.d_input = d_input
+        self.d_output = d_output
+        self.use_bias = use_bias
+        super(TransposedLinear, self).__init__()
+    def build(self, input_shape):
+        weight_initializer = keras.initializers.HeUniform()
+        self.weight = weight_initializer(shape=(self.d_output, self.d_input))
+        if self.use_bias:
+            bound = 1 / math.sqrt(self.d_input)
+            bias_initializer = keras.initializers.random_uniform(minval=-bound, maxval=bound)
+            self.bias = bias_initializer(shape=(self.d_output, 1))
+        else:
+            self.bias = 0.0
+    def call(self, x):
+        return contract('... u l, v u -> ... v l', x, self.weight) + self.bias
+
+def LinearActivation(
+        d_input, d_output, bias=True,
+        zero_bias_init=False,
+        transposed=False,
+        initializer=None,
+        activation=None,
+        activate=False, # Apply activation as part of this module
+        weight_norm=False,
+        **kwargs,
+    ):
+    """ Returns a linear layer with control over axes order, initialization, and activation """
+
+    # Construct core module
+    linear_cls = TransposedLinear if transposed else keras.layers.Dense
+    if activation == 'glu': d_output *= 2
+    linear = linear_cls(d_input, d_output, use_bias=bias, **kwargs)
+
+    # Initialize weight
+    if initializer is not None:
+        get_initializer(initializer, activation)(linear.weight)
+
+    # Initialize bias
+    if bias and zero_bias_init:
+        nn.init.zeros_(linear.bias)
+
+    # Weight norm
+    if weight_norm:
+        linear = nn.utils.weight_norm(linear)
+
+    if activate and activation is not None:
+        activation = Activation(activation, dim=-2 if transposed else -1)
+        linear = nn.Sequential(linear, activation)
+    return linear
+
+
+class S4(keras.layers.Layer):
     def __init__(
             self,
             d_model,
@@ -743,7 +887,7 @@ class S4(keras.layers.Layer):
         # Pointwise
         self.activation = Activation(activation)
         dropout_fn = keras.layers.SpatialDropout2D if self.transposed else keras.layers.Dropout
-        self.dropout = dropout_fn(dropout) if dropout > 0.0 else keras.layers.Identity()
+        self.dropout = dropout_fn(dropout) if dropout > 0.0 else Identity()
 
         # position-wise output transform to mix features
         self.output_linear = LinearActivation(
@@ -765,29 +909,44 @@ class S4(keras.layers.Layer):
 
         Returns: same shape as u
         """
+        # print('S4Model | S4 | u.shape: ', u.shape)
+        # print('S4Model | S4 | self.h: ', self.h)
+
         if not self.transposed: u = u.transpose(-1, -2)
-        L = u.size(-1)
+        L = u.shape[-1]
 
         # Compute SS Kernel
+        # print('S4Model | S4 | L: ', L)
         k = self.kernel(L=L)  # (C H L) (B C H L)
 
         # Convolution
         if self.bidirectional:
-            k0, k1 = rearrange(k, '(s c) h l -> s c h l', s=2)
-            k = F.pad(k0, (0, L)) \
-                + F.pad(k1.flip(-1), (L, 0)) \
+            # k0, k1 = rearrange(k, '(s c) h l -> s c h l', s=2)
+            # print('S4Model | S4 | k.shape', k.shape)
+            k0, k1 = tf.expand_dims(k[0],axis=0), tf.expand_dims(k[1],axis=0)
+            # print('S4Model | S4 | k0.shape', k0.shape)
+            # print('S4Model | S4 | k1.shape', k1.shape)
+            pad0 = np.zeros([3,2])
+            pad0[2,1] = L
+            pad1 = np.zeros([3,2])
+            pad1[2,1] = L
+            # k = F.pad(k0, (0, L)) + F.pad(k1.flip(-1), (L, 0))
+            k = tf.pad(k0, paddings=pad0) + tf.pad(tf.reverse(k1, axis=[-1]), paddings=pad1)
+            # print('S4Model | S4 | k.shape', k.shape)
 
+        # print('S4Model | S4 | L', L)
         # k_f = torch.fft.rfft(k, n=2 * L)  # (C H L)
-        k_f = tf.signal.rfft(input=k, fft_length=2 * L)  # (C H L)
+        k_f = tf.signal.rfft( input_tensor=k, fft_length=tf.constant(value=[2*L]) ) # (C H L)
         # u_f = torch.fft.rfft(u, n=2 * L)  # (B H L)
-        u_f = tf.signal.rfft(input=u, fft_length=2 * L)  # (B H L)
+        u_f = tf.signal.rfft( input_tensor=u, fft_length=tf.constant(value=[2*L]) ) # (B H L)
 
-        y_f = contract('bhl,chl->bchl', u_f, k_f)  # k_f.unsqueeze(-4) * u_f.unsqueeze(-3) # (B C H L)
+        y_f = contract('bhl,chl->bchl', u_f, k_f) # (B C H L)
         # y = tf.signal.irfft(y_f, n=2 * L)[..., :L]  # (B C H L)
-        y = tf.signal.irfft(y_f, n=2 * L)[..., :L]  # (B C H L)
+        # print('S4Model | S4 | y_f.shape:', y_f.shape)
+        y = tf.signal.irfft(y_f, fft_length=tf.constant(value=[2*L]))[..., :L]  # (B C H L)
 
         # Compute D term in state space equation - essentially a skip connection
-        y = y + contract('bhl,ch->bchl', u, self.D)  # u.unsqueeze(-3) * self.D.unsqueeze(-1)
+        y = y + contract('bhl,ch->bchl', u, self.D)
 
         # Optional hyper-network multiplication
         if self.hyper:
@@ -818,12 +977,12 @@ class S4(keras.layers.Layer):
         assert not self.training
 
         y, next_state = self.kernel.step(u, state)  # (B C H)
-        u_2 = tf.expand_dims(u, axis=-2) # u.unsqueeze(-2)
+        u_2 = tf.expand_dims(u, axis=-2)
         y = y + u_2 * self.D
         y = rearrange(y, '... c h -> ... (c h)')
         y = self.activation(y)
         if self.transposed:
-            y_1 = tf.expand(y, axis=-1) # y.unsqueeze(-1)
+            y_1 = tf.expand(y, axis=-1)
             y = self.output_linear( y_1 )
             y = tf.squeeze(y, axis=-1) # .squeeze(-1)
         else:
@@ -850,20 +1009,20 @@ class S4Layer(keras.layers.Layer):
     # S4 Layer that can be used as a drop-in replacement for a TransformerEncoder
     def __init__(self, features, lmax, N=64, dropout=0.0, bidirectional=True, layer_norm=True):
         super().__init__()
-        # print('S4Model/S4Layer: features=', features)
         self.s4_layer = S4(d_model=features,
                             d_state=N,
                             l_max=lmax,
                             bidirectional=bidirectional)
-
-        self.norm_layer = keras.layers.LayerNormalization(features) if layer_norm else keras.layers.Identity()
-        self.dropout = keras.layers.SpatialDropout2D(dropout) if dropout >0 else keras.layers.Identity()
+        # print('S4Model | S4Layer | features:', features)
+        self.norm_layer = keras.layers.LayerNormalization(axis=-1) if layer_norm else Identity()
+        self.dropout = keras.layers.SpatialDropout2D(dropout) if dropout >0 else Identity()
 
     def call(self, x):
         # x has shape seq, batch, feature
-        x = x.permute((1,2,0))  # batch, feature, seq (as expected from S4 with transposed=True)
+        x = tf.transpose(x, perm=[1,2,0])  # batch, feature, seq (as expected from S4 with transposed=True)
         xout, _ = self.s4_layer(x)  # batch, feature, seq
         xout = self.dropout(xout)
         xout = xout + x # skip connection   # batch, feature, seq
-        xout = xout.permute((2 ,0 ,1)) # seq, batch, feature
+        xout = tf.transpose(xout, perm=[2,0,1]) # seq, batch, feature
+        # print('S4Model | S4Layer | xout.shape:', xout.shape)
         return self.norm_layer(xout)
