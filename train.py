@@ -4,6 +4,7 @@ import os
 from tensorflow import keras
 import tensorflow as tf
 import numpy as np
+import time
 
 from util import calc_diffusion_hyperparams, find_max_epoch, get_mask_rm, get_mask_mnr, get_mask_bm, training_loss
 from SSSDS4Imputers import SSSDS4Imputer
@@ -41,10 +42,26 @@ def train(output_directory,
     # load checkpoint
     if ckpt_iter == 'max':
         ckpt_iter = find_max_epoch(output_directory)
+        print(ckpt_iter)
     if ckpt_iter >= 0:
         try:
             # load checkpoint file
-            model_path = os.path.join(output_directory, '{}.pkl'.format(ckpt_iter))
+
+            # model_path = os.path.join(output_directory, '{}.h5'.format(ckpt_iter))
+            # model.load_weights(model_path)
+
+            # latest = tf.train.latest_checkpoint(output_directory)
+            # print('train | latest: ', latest)
+            # model.load_weights(latest)
+
+            # model_path = os.path.join(output_directory, '{}cpm'.format(ckpt_iter))
+            # model = keras.models.load_model(model_path)
+            # model.summary()
+
+            # model_path = os.path.join(output_directory, '{}.pkl'.format(ckpt_iter))
+            # model.load_weights(model_path)
+
+            model_path = os.path.join(output_directory, '{}ckpt'.format(ckpt_iter))
             model.load_weights(model_path)
             print('Successfully loaded model at iteration {}'.format(ckpt_iter))
         except:
@@ -56,13 +73,14 @@ def train(output_directory,
 
     ### Custom data loading and reshaping ###
     training_data = np.load(trainset_config['train_data_path'])
-    training_data = np.split(training_data, 160, 0)
+    training_data = np.split(training_data, 320, 0)
     training_data = np.array(training_data)
     training_data = tf.convert_to_tensor(training_data, dtype=tf.dtypes.float32)
     print('Data loaded')
 
-    model.summary()
+
     # training
+    time_start = time.time()
     n_iter = ckpt_iter + 1
     while n_iter < n_iters + 1:
         for batch in training_data:
@@ -73,7 +91,7 @@ def train(output_directory,
                 transposed_mask = get_mask_mnr(batch[0], missing_k)
             elif masking == 'bm':
                 transposed_mask = get_mask_bm(batch[0], missing_k)
-            print(masking, transposed_mask.shape)
+            # print(masking, transposed_mask.shape)
 
             mask = np.transpose(transposed_mask)
             mask = np.expand_dims(mask, axis=0)
@@ -86,20 +104,23 @@ def train(output_directory,
             # print('train | batch.shape after:', batch.shape)
             assert batch.shape == mask.shape == loss_mask.shape
 
-            # back-propagation
             X = batch, batch, mask, loss_mask
             loss = training_loss(model, X, diffusion_hyperparams,
                                  only_generate_missing=only_generate_missing)
+            # model.summary()
+            # for i,w in enumerate(model.weights):
+            #     print(i, w.name)
+
 
             if n_iter % iters_per_logging == 0:
-                print("iteration: {} \tloss: {}".format(n_iter, loss))
-
+                time_end = time.time()
+                print("iteration: {} \tloss: {} \tExe time for this update: {:.3f}s".format(n_iter, loss, time_end-time_start))
+                time_start = time_end
             # save checkpoint
             if n_iter > 0 and n_iter % iters_per_ckpt == 0:
-                checkpoint_name = '{}.pkl'.format(n_iter)
-                torch.save({'model_state_dict': net.state_dict(),
-                            'optimizer_state_dict': optimizer.state_dict()},
-                           os.path.join(output_directory, checkpoint_name))
+                # checkpoint_name = '{}.pkl'.format(n_iter)
+                checkpoint_name = '{}ckpt'.format(n_iter)
+                model.save_weights(os.path.join(output_directory, checkpoint_name))
                 print('model at iteration %s is saved' % n_iter)
 
             n_iter += 1

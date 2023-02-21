@@ -27,11 +27,37 @@ def find_max_epoch(path):
     files = os.listdir(path)
     epoch = -1
     for f in files:
-        if len(f) <= 4:
+        # name = f.split('.')[0]
+        # if name[-4:] == 'ckpt':
+        #     try:
+        #         epoch = max(epoch, int(name[:-4]))
+
+        # if len(f) <= 3:
+        #     continue
+        # if f[-3:] == '.h5':
+        #     try:
+        #         epoch = max(epoch, int(f[:-3]))
+
+        # if f[-3:] == 'cpm':
+        #     try:
+        #         epoch = max(epoch, int(f[:-3]))
+
+        # if len(f) <= 4:
+        #     continue
+        # if f[-4:] == '.pkl':
+        #     try:
+        #         epoch = max(epoch, int(f[:-4]))
+
+        name = f.split('.')
+        # if len(name) != 3:
+        #     continue
+        # if name[1] == 'pkl':
+        if len(name) != 2:
             continue
-        if f[-4:] == '.pkl':
+        name = name[0]
+        if name[-4:] == 'ckpt':
             try:
-                epoch = max(epoch, int(f[:-4]))
+                epoch = max(epoch, int(name[:-4]))
             except:
                 continue
     return epoch
@@ -163,23 +189,26 @@ def training_loss(net, X, diffusion_hyperparams, only_generate_missing=1):
     loss_mask = X[3]
 
     B, C, L = audio.shape  # B is batchsize, C=1, L is audio length
-    diffusion_steps = tf.experimental.numpy.random.randint(low=1, high=T, size=(B, 1, 1))  # randomly sample diffusion steps from 1~T
-
+    diffusion_steps = np.random.randint(T, size=B)
     z = tf.random.normal(audio.shape)
     if only_generate_missing == 1:
         z = audio * mask + z * (1 - mask)
-    transformed_X = tf.math.sqrt(tf.Variable(Alpha_bar[diffusion_steps], dtype=tf.dtypes.float32)) * audio + tf.math.sqrt(
-        tf.Variable(1 - Alpha_bar[diffusion_steps], dtype=tf.dtypes.float32)) * z  # compute x_t from q(x_t|x_0)
+    # print('util | training_loss | Alpha_bar: ', Alpha_bar)
+    # print('util | training_loss | diffusion_steps: ', diffusion_steps)
+    # print('util | training_loss | Alpha_bar[diffusion_steps]: ', Alpha_bar[diffusion_steps])
+    transformed_X = tf.math.sqrt( tf.constant(Alpha_bar[diffusion_steps], dtype=tf.float32, shape=[B,1,1]) ) * audio +\
+                    tf.math.sqrt( tf.constant((1 - Alpha_bar[diffusion_steps]), dtype=tf.float32, shape=[B,1,1]) ) * z
     # epsilon_theta = net(
     #     (transformed_X, cond, mask, diffusion_steps.view(B, 1),))  # predict \epsilon according to \epsilon_\theta
     # print('util | training_loss | transformed_X.shape: ', transformed_X.shape)
-    # print('util | training_loss | z.shape: ', z.shape)
+    # print('util | training_loss | z.shape: ', z.shape)"""
+
     # noise, conditional, mask, diffusion_steps = input_data
     if only_generate_missing == 1:
-        return net.train_on_batch( x=(transformed_X, cond, mask, tf.squeeze(diffusion_steps, axis=2)), y=z*loss_mask )
+        return net.train_on_batch( x=(transformed_X, cond, mask, tf.constant(diffusion_steps, shape=[B,1])), y=z*loss_mask )
         # return loss_fn(epsilon_theta[loss_mask], z[loss_mask])
     elif only_generate_missing == 0:
-        return net.train_on_batch( x=(transformed_X, cond, mask, tf.squeeze(diffusion_steps, axis=2)), y=z )
+        return net.train_on_batch( x=(transformed_X, cond, mask, tf.constant(diffusion_steps, shape=[B,1])), y=z )
         # return loss_fn(epsilon_theta, z)
 
 
