@@ -2,10 +2,12 @@ import os
 import argparse
 import json
 import numpy as np
+import tensorflow as tf
+from tensorflow import keras
 
-from utils.util import get_mask_mnr, get_mask_bm, get_mask_rm
-from utils.util import find_max_epoch, print_size, sampling, calc_diffusion_hyperparams
-from imputers.SSSDS4Imputer import SSSDS4Imputer
+from util import get_mask_mnr, get_mask_bm, get_mask_rm
+from util import find_max_epoch, sampling, calc_diffusion_hyperparams
+from SSSDS4Imputers import SSSDS4Imputer
 
 from sklearn.metrics import mean_squared_error
 from statistics import mean
@@ -51,7 +53,7 @@ def generate(output_directory,
     # predefine model
     model = SSSDS4Imputer(**model_config)
     # define optimizer
-    opt = keras.optimizers.Adam(learning_rate=learning_rate)
+    opt = keras.optimizers.Adam(learning_rate=2e-4)
     model.compile(loss='mse', optimizer=opt)
 
     # load checkpoint
@@ -79,27 +81,26 @@ def generate(output_directory,
 
         if masking == 'mnr':
             mask_T = get_mask_mnr(batch[0], missing_k)
-            mask = mask_T.permute(1, 0)
-            mask = mask.repeat(batch.size()[0], 1, 1)
-            mask = tf.constant(mask, dtype=tf.dtypes.float32)
+            # mask = mask_T.permute(1, 0)
+            # mask = mask.repeat(batch.size()[0], 1, 1)
+            # mask = tf.constant(mask, dtype=tf.dtypes.float32)
 
         elif masking == 'bm':
             mask_T = get_mask_bm(batch[0], missing_k)
-            mask = mask_T.permute(1, 0)
-            mask = mask.repeat(batch.size()[0], 1, 1)
-            mask = tf.constant(mask, dtype=tf.dtypes.float32)
 
         elif masking == 'rm':
             mask_T = get_mask_rm(batch[0], missing_k)
-            mask = mask_T.permute(1, 0)
-            mask = mask.repeat(batch.size()[0], 1, 1)
-            mask = tf.constant(mask, dtype=tf.dtypes.float32)
 
-        batch = batch.permute(0, 2, 1)
+        mask = np.transpose(mask_T)
+        mask = np.expand_dims(mask, axis=0)
+        mask = np.tile(mask, reps=[batch.shape[0], 1, 1])
+        mask = tf.constant(mask, dtype=tf.dtypes.float32)
 
-        sample_length = batch.size(2)
-        sample_channels = batch.size(1)
-        generated_audio = sampling(net, (num_samples, sample_channels, sample_length),
+        batch = tf.transpose(batch, perm=[0, 2, 1])
+
+        sample_length = batch.shape[2]
+        sample_channels = batch.shape[1]
+        generated_audio = sampling(model, (num_samples, sample_channels, sample_length),
                                    diffusion_hyperparams,
                                    cond=batch,
                                    mask=mask,
