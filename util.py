@@ -71,13 +71,13 @@ def calc_diffusion_step_embedding(diffusion_steps, diffusion_step_embed_dim_in):
     [sin(t * 10^(0*4/63)), ... , sin(t * 10^(63*4/63)), cos(t * 10^(0*4/63)), ... , cos(t * 10^(63*4/63))]
 
     Parameters:
-    diffusion_steps (torch.long tensor, shape=(batchsize, 1)):     
+    diffusion_steps (.long tensor, shape=(batchsize, 1)):
                                 diffusion steps for batch data
     diffusion_step_embed_dim_in (int, default=128):  
                                 dimensionality of the embedding space for discrete diffusion steps
     
     Returns:
-    the embedding vectors (torch.tensor, shape=(batchsize, diffusion_step_embed_dim_in)):
+    the embedding vectors (.tensor, shape=(batchsize, diffusion_step_embed_dim_in)):
     """
     # print('util | calc_diffusion_step_embedding | diffusion_steps', diffusion_steps)
     # print('util | calc_diffusion_step_embedding | diffusion_step_embed_dim_in', diffusion_step_embed_dim_in)
@@ -104,7 +104,7 @@ def calc_diffusion_hyperparams(T, beta_0, beta_T):
     
     Returns:
     a dictionary of diffusion hyperparameters including:
-        T (int), Beta/Alpha/Alpha_bar/Sigma (torch.tensor on cpu, shape=(T, ))
+        T (int), Beta/Alpha/Alpha_bar/Sigma (.tensor on cpu, shape=(T, ))
         These cpu tensors are changed to cuda tensors on each individual gpu
     """
 
@@ -130,14 +130,14 @@ def sampling(net, size, diffusion_hyperparams, cond, mask, only_generate_missing
     Perform the complete sampling step according to p(x_0|x_T) = \prod_{t=1}^T p_{\theta}(x_{t-1}|x_t)
 
     Parameters:
-    net (torch network):            the wavenet model
+    net (network):            the wavenet model
     size (tuple):                   size of tensor to be generated, 
                                     usually is (number of audios to generate, channels=1, length of audio)
     diffusion_hyperparams (dict):   dictionary of diffusion hyperparameters returned by calc_diffusion_hyperparams
                                     note, the tensors need to be cuda tensors 
     
     Returns:
-    the generated audio(s) in torch.tensor, shape=size
+    the generated audio(s) in .tensor, shape=size
     """
 
     _dh = diffusion_hyperparams
@@ -151,16 +151,15 @@ def sampling(net, size, diffusion_hyperparams, cond, mask, only_generate_missing
 
     x = tf.random.normal(size)
 
-    with torch.no_grad():
-        for t in range(T - 1, -1, -1):
-            if only_generate_missing == 1:
-                x = x * (1 - mask).float() + cond * mask.float()
-            diffusion_steps = (t * torch.ones((size[0], 1))).cuda()  # use the corresponding reverse step
-            epsilon_theta = net((x, cond, mask, diffusion_steps,))  # predict \epsilon according to \epsilon_\theta
-            # update x_{t-1} to \mu_\theta(x_t)
-            x = (x - (1 - Alpha[t]) / tf.math.sqrt(1 - Alpha_bar[t]) * epsilon_theta) / tf.math.sqrt(Alpha[t])
-            if t > 0:
-                x = x + Sigma[t] * tf.random.normal(size)  # add the variance term to x_{t-1}
+    for t in range(T - 1, -1, -1):
+        if only_generate_missing == 1:
+            x = x * (1 - mask).float() + cond * mask.float()
+        diffusion_steps = (t * np.ones((size[0], 1)))  # use the corresponding reverse step
+        epsilon_theta = net((x, cond, mask, diffusion_steps,))  # predict \epsilon according to \epsilon_\theta
+        # update x_{t-1} to \mu_\theta(x_t)
+        x = (x - (1 - Alpha[t]) / tf.math.sqrt(1 - Alpha_bar[t]) * epsilon_theta) / tf.math.sqrt(Alpha[t])
+        if t > 0:
+            x = x + Sigma[t] * tf.random.normal(size)  # add the variance term to x_{t-1}
 
     return x
 
@@ -170,9 +169,9 @@ def training_loss(net, X, diffusion_hyperparams, only_generate_missing=1):
     Compute the training loss of epsilon and epsilon_theta
 
     Parameters:
-    net (torch network):            the wavenet model
-    loss_fn (torch loss function):  the loss function, default is nn.MSELoss()
-    X (torch.tensor):               training data, shape=(batchsize, 1, length of audio)
+    net (network):            the wavenet model
+    loss_fn (loss function):  the loss function, default is nn.MSELoss()
+    X (tensor):               training data, shape=(batchsize, 1, length of audio)
     diffusion_hyperparams (dict):   dictionary of diffusion hyperparameters returned by calc_diffusion_hyperparams
                                     note, the tensors need to be cuda tensors       
     
